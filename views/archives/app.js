@@ -186,7 +186,12 @@ async function openArchive(id) {
   if (!canLeave()) { $("archive-picker").value = previous || ""; return; }
   try {
     $("archive-picker").disabled = true;
-    const data = await bridge.apiGet(`archives/${id}`);
+    let data = await bridge.apiGet(`archives/${id}`);
+    if (!data.document) {
+      notify("已同步会话，正在读取当前人设并初始化世界书与角色卡…");
+      await bridge.apiPost(`archives/${id}/initialize`, {});
+      data = await bridge.apiGet(`archives/${id}`);
+    }
     state.loaded = data; state.draft = clone(data); state.selected = "world"; state.editing = false; state.dirty = false;
     const entry = state.archives.find((item) => item.id === id);
     $("archive-origin").textContent = entry?.origin || (entry?.conversation ? `会话 ${entry.conversation}` : "当前会话的独立档案");
@@ -205,7 +210,7 @@ async function refresh() {
     $("archive-picker").replaceChildren(...state.archives.map((item) => node("option", { value: item.id, text: `${item.title} · ${(item.conversation || item.id).slice(0, 8)}` })));
     if (!state.archives.length) {
       state.loaded = null; state.draft = null; state.editing = false; state.dirty = false;
-      $("empty").hidden = false; $("workspace").hidden = true; $("empty-text").textContent = "还没有会话档案。首次对话时会自动读取 AstrBot 当前选中的人设，生成世界书与角色卡，无需在这里手动填写。开始对话后再刷新即可。";
+      $("empty").hidden = false; $("workspace").hidden = true; $("empty-text").textContent = "尚未发现 AstrBot 会话。创建会话并选择人设后，点击同步会话即可初始化；普通对话也会自动初始化。";
       $("archive-picker").append(node("option", { text: "暂无会话档案" }));
       $("archive-picker").disabled = true; renderNavigation(); return;
     }

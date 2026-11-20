@@ -1,9 +1,11 @@
 """Scene routing each turn; character and world growth only at compaction."""
 
 import asyncio
+import copy
 import hashlib
 import json
 import weakref
+from collections import ChainMap
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -20,13 +22,12 @@ from .bridge import CompressionBridge, narrative, replace_summary
 from .engine import (
     ArchiveStore,
     apply_candidates,
-    new_archive,
     parse_json,
     render,
     validate_candidates,
 )
-from .importer import parse_marked_persona
-from .prompts import COMPACT, DECISIONS, IMPORT, REPAIR
+from .prompts import COMPACT, DECISIONS, REPAIR
+from .sessions import ArchiveSessions, InitializationError
 from .webui import ArchiveWebAPI
 
 
@@ -48,6 +49,7 @@ class LivingCharacters(Star):
         self.locks = weakref.WeakValueDictionary()
         self.scenes = {}
         self.bridges = set()
+        self.sessions = ArchiveSessions(self)
         self.webui = ArchiveWebAPI(self)
 
     async def analyze(self, event, instruction, payload, model=None):
@@ -79,15 +81,61 @@ class LivingCharacters(Star):
         kwargs = (
             {"model": model} if model and not isinstance(provider, Provider) else {}
         )
-        response = await asyncio.wait_for(
-            self.context.llm_generate(
-                chat_provider_id=provider_id,
-                system_prompt=instruction,
-                prompt=json.dumps(payload, ensure_ascii=False),
-                **kwargs,
-            ),
-            timeout=90,
-        )
+        prompt = json.dumps(payload, ensure_ascii=False)
+        chat = self.context.get_provider_by_id(provider_id)
+        from astrbot.core.provider.sources.openai_source import ProviderOpenAIOfficial
+
+        # Chat output limits can be tiny (e.g. 256 tokens). Scope a larger JSON
+        # budget to this auxiliary call without mutating the live chat provider.
+        if isinstance(chat, ProviderOpenAIOfficial):
+            extra = dict(chat.provider_config.get("custom_extra_body") or {})
+            key = (
+                "max_completion_tokens"
+                if "max_completion_tokens" in extra
+                else "max_tokens"
+            )
+            minimum = (
+                min(16384, max(8192, len(prompt) * 2))
+                if instruction != DECISIONS
+                else min(8192, max(1024, len(payload.get("questions", {})) * 32 + 256))
+            )
+            configured_limit = extra.get(key, chat.provider_config.get(key, 0))
+            if (
+                not isinstance(configured_limit, (int, float))
+                or isinstance(configured_limit, bool)
+                or configured_limit < minimum
+            ):
+                extra[key] = minimum
+                scoped = copy.copy(chat)
+                scoped.provider_config = ChainMap(
+                    {"custom_extra_body": extra}, chat.provider_config
+                )
+                response = await asyncio.wait_for(
+                    scoped.text_chat(
+                        prompt=prompt, system_prompt=instruction, **kwargs
+                    ),
+                    timeout=90,
+                )
+            else:
+                response = await asyncio.wait_for(
+                    self.context.llm_generate(
+                        chat_provider_id=provider_id,
+                        system_prompt=instruction,
+                        prompt=prompt,
+                        **kwargs,
+                    ),
+                    timeout=90,
+                )
+        else:
+            response = await asyncio.wait_for(
+                self.context.llm_generate(
+                    chat_provider_id=provider_id,
+                    system_prompt=instruction,
+                    prompt=prompt,
+                    **kwargs,
+                ),
+                timeout=90,
+            )
         if response.role != "assistant" or not response.completion_text:
             raise ValueError("No assistant JSON completion")
         return parse_json(response.completion_text)
@@ -263,34 +311,22 @@ class LivingCharacters(Star):
             return
         wrapped = matches[0]
         prefix, suffix = req.system_prompt.split(wrapped)
-        scope = json.dumps(
-            [
-                event.unified_msg_origin,
-                req.conversation.cid,
-                event.get_extra("_trace_persona_id"),
-                hashlib.sha256(original.encode()).hexdigest(),
-            ]
+        scope = self.sessions.scope(
+            event.unified_msg_origin,
+            req.conversation.cid,
+            event.get_extra("_trace_persona_id"),
+            original,
         )
-        lock = self.locks.setdefault(self.store.path(scope).stem, asyncio.Lock())
-        async with lock:
-            try:
-                archive = self.store.load(scope)
-                if archive is None:
-                    archive = parse_marked_persona(original)
-                    if archive is None:
-                        archive = new_archive(
-                            await self.analyze(
-                                event, IMPORT, {"persona": original}, req.model
-                            )
-                        )
-                    archive["label"] = {
-                        "title": str(
-                            event.get_extra("_trace_persona_id") or "剧情档案"
-                        ),
-                        "conversation": str(req.conversation.cid),
-                        "origin": event.unified_msg_origin,
-                    }
-                    self.store.save(scope, archive)
+        try:
+            scope, archive = await self.sessions.initialize(
+                event,
+                original,
+                event.get_extra("_trace_persona_id"),
+                req.conversation.cid,
+                req.model,
+            )
+            lock = self.locks.setdefault(self.store.path(scope).stem, asyncio.Lock())
+            async with lock:
                 history = []
                 for item in req.contexts:
                     if item.get("role") not in ("user", "assistant"):
@@ -325,11 +361,14 @@ class LivingCharacters(Star):
                         "original_system": prefix + wrapped + suffix,
                     },
                 )
-            except Exception as exc:
-                logger.warning(
-                    "Living characters import failed (%s); preserving original persona",
-                    type(exc).__name__,
-                )
+        except Exception as exc:
+            reason = (
+                str(exc) if isinstance(exc, InitializationError) else type(exc).__name__
+            )
+            logger.warning(
+                "Living characters initialization/request preparation failed: %s; preserving original persona",
+                reason,
+            )
 
     @filter.on_agent_begin()
     async def bind_compression(self, event, run_context):
@@ -691,3 +730,5 @@ class LivingCharacters(Star):
         self.bridges.clear()
         self.scenes.clear()
         self.webui.close()
+        self.sessions.references.clear()
+        self.sessions.errors.clear()

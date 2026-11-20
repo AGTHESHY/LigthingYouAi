@@ -7,6 +7,7 @@ import json
 from astrbot.api.web import error_response, json_response, request
 
 from .engine import checked_text, new_archive
+from .sessions import InitializationError
 
 PLUGIN_NAME = "astrbot_plugin_living_characters"
 
@@ -40,6 +41,12 @@ class ArchiveWebAPI:
                 ["POST"],
                 "Save a story archive",
             ),
+            (
+                f"/{PLUGIN_NAME}/archives/<archive_id>/initialize",
+                self.initialize_archive,
+                ["POST"],
+                "Initialize a native conversation archive",
+            ),
         ]
         for route in self.routes:
             plugin.context.register_web_api(*route)
@@ -52,7 +59,22 @@ class ArchiveWebAPI:
         """
         if not request.username:
             return error_response("请先登录 AstrBot WebUI", status_code=401)
-        items = []
+        references = dict(await self.plugin.sessions.refresh())
+        items = {
+            archive_id: {
+                "id": archive_id,
+                "title": reference["title"],
+                "conversation": reference["conversation"],
+                "origin": reference["origin"],
+                "status": "failed"
+                if archive_id in self.plugin.sessions.errors
+                else reference["status"],
+                "error": self.plugin.sessions.errors.get(archive_id, ""),
+                "characters": 0,
+                "revision": 0,
+            }
+            for archive_id, reference in references.items()
+        }
         for path in self.plugin.store.directory.glob("*.json"):
             try:
                 archive = self.plugin.store.load_id(path.stem)
@@ -60,21 +82,18 @@ class ArchiveWebAPI:
                     continue
                 label = archive.get("label", {})
                 names = [r["name"] for r in archive["characters"].values()]
-                items.append(
-                    {
-                        "id": path.stem,
-                        "title": label.get("title")
-                        or "、".join(names[:3])
-                        or "剧情档案",
-                        "conversation": label.get("conversation", ""),
-                        "origin": label.get("origin", ""),
-                        "characters": len(names),
-                        "revision": archive["revision"],
-                    }
-                )
+                items[path.stem] = {
+                    "id": path.stem,
+                    "title": label.get("title") or "、".join(names[:3]) or "剧情档案",
+                    "conversation": label.get("conversation", ""),
+                    "origin": label.get("origin", ""),
+                    "characters": len(names),
+                    "revision": archive["revision"],
+                    "status": "ready",
+                }
             except (ValueError, OSError, KeyError, TypeError):
                 continue
-        items.sort(key=lambda item: (item["title"], item["id"]))
+        items = sorted(items.values(), key=lambda item: (item["title"], item["id"]))
         return json_response({"archives": items})
 
     async def get_archive(self, archive_id):
@@ -91,7 +110,19 @@ class ArchiveWebAPI:
         try:
             archive = self.plugin.store.load_id(archive_id)
             if archive is None:
-                return error_response("档案不存在", status_code=404)
+                await self.plugin.sessions.refresh()
+                reference = self.plugin.sessions.references.get(archive_id)
+                if reference is None:
+                    return error_response("档案不存在", status_code=404)
+                return json_response(
+                    {
+                        "id": archive_id,
+                        "title": reference["title"],
+                        "status": reference["status"],
+                        "error": self.plugin.sessions.errors.get(archive_id, ""),
+                        "document": None,
+                    }
+                )
             document = {
                 "world": archive["world"],
                 "worldbook": archive["worldbook"],
@@ -115,6 +146,25 @@ class ArchiveWebAPI:
             return error_response("档案标识或档案结构无效", status_code=400)
         except (OSError, KeyError, TypeError):
             return error_response("无法读取档案，请检查文件是否完整", status_code=400)
+
+    async def initialize_archive(self, archive_id):
+        """Initialize the selected native session from its effective persona.
+
+        Args:
+            archive_id: Server-generated native catalog identifier.
+
+        Returns:
+            Initialization acknowledgement or a safe explanation.
+        """
+        if not request.username:
+            return error_response("请先登录 AstrBot WebUI", status_code=401)
+        try:
+            await self.plugin.sessions.initialize_id(archive_id)
+            return json_response({"initialized": True})
+        except InitializationError as exc:
+            return error_response(str(exc), status_code=422)
+        except ValueError:
+            return error_response("档案标识无效", status_code=400)
 
     async def save_archive(self, archive_id):
         """Apply explicit author edits while preventing stale compaction writes.

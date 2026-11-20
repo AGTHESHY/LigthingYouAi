@@ -1,7 +1,7 @@
 name: astrbot_plugin_living_characters
 display_name: 成长角色与世界书
 desc: 按场景加载角色卡，仅在压缩时更新角色记忆与宏观世界书。
-version: v0.3.1
+version: v0.3.2
 author: AGTHESHY
 astrbot_version: ">=4.29.4,<5"
 repo: https://github.com/AGTHESHY/LigthingYouAi

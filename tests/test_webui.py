@@ -66,7 +66,7 @@ def editable(plugin, archive):
 
 
 def test_api_routes_are_registered_under_plugin_namespace(plugin):
-    assert plugin.context.register_web_api.call_count == 3
+    assert plugin.context.register_web_api.call_count == 4
     assert all(
         c.args[0].startswith("/astrbot_plugin_living_characters/")
         for c in plugin.context.register_web_api.call_args_list
