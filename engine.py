@@ -1,27 +1,28 @@
-"""Validated character archives independent of AstrBot's runtime."""
+"""Validated atomic archives for characters and a growing macro worldbook."""
 
 import copy
 import hashlib
 import json
+import re
 from pathlib import Path
 
 from .prompts import INJECTION
 
 
 def parse_json(text: str) -> dict:
-    """Parse one bounded JSON object, allowing a single Markdown fence.
+    """Parse a bounded JSON object, permitting one surrounding code fence.
 
     Args:
-        text: Model completion without reasoning content.
+        text: Model completion.
 
     Returns:
-        Decoded JSON object.
+        Parsed object.
 
     Raises:
-        ValueError: The completion is oversized or is not a JSON object.
+        ValueError: Invalid JSON or an oversized result.
     """
-    if len(text) > 500_000:
-        raise ValueError("Model output exceeds archive limits")
+    if not isinstance(text, str) or len(text) > 500_000:
+        raise ValueError("Invalid model output size")
     text = text.strip()
     if text.startswith("```json\n") and text.endswith("```"):
         text = text[8:-3].strip()
@@ -29,245 +30,442 @@ def parse_json(text: str) -> dict:
         text = text[4:-3].strip()
     data = json.loads(text)
     if not isinstance(data, dict):
-        raise ValueError("Expected an object")
+        raise ValueError("Expected JSON object")
     return data
 
 
-def checked_text(value, limit: int = 8000, allow_empty: bool = True) -> str:
-    """Validate text without silently truncating authored facts.
+def checked_text(value, limit=8000, allow_empty=True):
+    """Check text without truncating authored facts.
 
     Args:
         value: Candidate text.
-        limit: Maximum character count.
-        allow_empty: Whether blank text is valid.
+        limit: Maximum length.
+        allow_empty: Whether blank text is allowed.
 
     Returns:
         Original text.
 
     Raises:
-        ValueError: The value violates the text contract.
+        ValueError: Text violates the contract.
     """
-    if not isinstance(value, str) or len(value) > limit:
-        raise ValueError("Invalid text field")
-    if not allow_empty and not value.strip():
-        raise ValueError("Empty required text")
+    if (
+        not isinstance(value, str)
+        or len(value) > limit
+        or (not allow_empty and not value.strip())
+    ):
+        raise ValueError("Invalid text")
     return value
 
 
-def new_archive(data: dict) -> dict:
-    """Validate a complete initial decomposition before replacing any prompt.
+def text_map(value):
+    """Validate a map of single named facts.
 
     Args:
-        data: Import model result.
+        value: Model-provided object.
 
     Returns:
-        Independent validated archive.
+        Independent validated map.
 
     Raises:
-        ValueError: Required fields or character IDs are invalid.
+        ValueError: A key or value is invalid.
     """
-    world = checked_text(data.get("world"), 24000)
-    characters = data.get("characters")
-    if not isinstance(characters, list) or not 1 <= len(characters) <= 100:
-        raise ValueError("Persona must contain between 1 and 100 characters")
-    result = {"world": world, "characters": {}, "active": [], "revision": 0}
+    if not isinstance(value, dict) or len(value) > 200:
+        raise ValueError("Invalid fact map")
+    return {
+        checked_text(k, 100, False): checked_text(v, 4000, False)
+        for k, v in value.items()
+    }
+
+
+def new_archive(data):
+    """Separate immutable author rules, macro world state, and character facts.
+
+    Args:
+        data: Import JSON.
+
+    Returns:
+        Validated version-two archive.
+
+    Raises:
+        ValueError: Import fields are invalid.
+    """
+    if set(data) != {"world", "worldbook", "characters"}:
+        raise ValueError("Invalid import fields")
+    world = checked_text(data["world"], 32000, False)
+    book = data["worldbook"]
+    if not isinstance(book, dict) or set(book) != {
+        "facts",
+        "factions",
+        "relations",
+        "events",
+    }:
+        raise ValueError("Invalid worldbook")
+    factions = text_map(book["factions"])
+    relations = book["relations"]
+    events = book["events"]
+    if (
+        not isinstance(relations, list)
+        or not isinstance(events, list)
+        or len(events) > 300
+    ):
+        raise ValueError("Invalid world history")
+    seen_pairs = set()
+    for rel in relations:
+        if not isinstance(rel, dict) or set(rel) != {"source", "target", "value"}:
+            raise ValueError("Invalid faction relation")
+        if (
+            rel["source"] not in factions
+            or rel["target"] not in factions
+            or rel["source"] == rel["target"]
+        ):
+            raise ValueError("Faction endpoints must be distinct factions")
+        pair = (rel["source"], rel["target"])
+        if pair in seen_pairs:
+            raise ValueError("Duplicate faction relation")
+        seen_pairs.add(pair)
+        checked_text(rel["value"], 4000, False)
+    result = {
+        "version": 2,
+        "world": world,
+        "worldbook": {
+            "facts": text_map(book["facts"]),
+            "factions": factions,
+            "relations": copy.deepcopy(relations),
+            "events": [checked_text(e, 2000, False) for e in events],
+        },
+        "characters": {},
+        "active": [],
+        "revision": 0,
+    }
+    roles = data["characters"]
+    if not isinstance(roles, list) or not 1 <= len(roles) <= 100:
+        raise ValueError("Expected named non-player characters")
     names = set()
-    for index, item in enumerate(characters, 1):
-        if not isinstance(item, dict) or item.get("id") != f"r{index}":
-            raise ValueError("Character IDs must be sequential and unique")
-        name = checked_text(item.get("name"), 100, False)
+    for index, role in enumerate(roles, 1):
+        if (
+            not isinstance(role, dict)
+            or set(role)
+            != {
+                "id",
+                "name",
+                "controller",
+                "core",
+                "state",
+                "growth",
+                "knowledge",
+                "memories",
+            }
+            or role["id"] != f"r{index}"
+        ):
+            raise ValueError("Invalid character schema")
+        if role["controller"] not in ("ai", "user"):
+            raise ValueError("Invalid role controller")
+        name = checked_text(role["name"], 100, False)
         if name in names:
-            raise ValueError("Duplicate character name")
+            raise ValueError("Duplicate role name")
         names.add(name)
-        role = {
-            "name": name,
-            "core": checked_text(item.get("core"), allow_empty=False),
-            "state": checked_text(item.get("state")),
-            "growth": checked_text(item.get("growth")),
-            "memories": [],
-        }
-        memories = item.get("memories")
+        memories = role["memories"]
         if not isinstance(memories, list) or len(memories) > 300:
-            raise ValueError("Invalid initial memories")
-        for memory in memories:
-            if not isinstance(memory, dict) or type(memory.get("known")) is not bool:
-                raise ValueError("Memory knowledge must be explicit")
-            role["memories"].append(
-                {
-                    "text": checked_text(memory.get("text"), 2000, False),
-                    "known": memory["known"],
-                }
-            )
-        result["characters"][item["id"]] = role
+            raise ValueError("Invalid memories")
+        for mem in memories:
+            if (
+                not isinstance(mem, dict)
+                or set(mem) != {"text", "known"}
+                or type(mem["known"]) is not bool
+            ):
+                raise ValueError("Invalid memory knowledge")
+            checked_text(mem["text"], 2000, False)
+        result["characters"][role["id"]] = {
+            "name": name,
+            "controller": role["controller"],
+            "core": checked_text(role["core"], 16000, False),
+            "state": text_map(role["state"]),
+            "growth": text_map(role["growth"]),
+            "knowledge": text_map(role["knowledge"]),
+            "memories": copy.deepcopy(memories),
+        }
     return result
 
 
-def apply_update(archive: dict, data: dict, evidence_source: str) -> dict:
-    """Apply only fully validated changes with verbatim story evidence.
+def validate_candidates(archive, data, source):
+    """Validate each atomic proposal before any model decision or write.
 
     Args:
-        archive: Previously validated archive.
-        data: Analysis model output.
-        evidence_source: Actual narrative supplied for this analysis.
+        archive: Existing archive.
+        data: Compaction extraction result.
+        source: Discarded narrative, the only allowed evidence source.
 
     Returns:
-        New archive; the input is never mutated.
+        Independent candidates and public summary.
 
     Raises:
-        ValueError: Any change lacks evidence or violates the schema.
+        ValueError: Any proposal is invalid or unsupported by quoted evidence.
+    """
+    if (
+        set(data) != {"candidates", "shared_summary"}
+        or not isinstance(data["candidates"], list)
+        or len(data["candidates"]) > 200
+    ):
+        raise ValueError("Invalid compaction schema")
+    summary = checked_text(data["shared_summary"], 8000, False)
+    candidates = copy.deepcopy(data["candidates"])
+    seen = set()
+    factions = set(archive["worldbook"]["factions"])
+    for c in candidates:
+        if (
+            isinstance(c, dict)
+            and c.get("kind") == "faction"
+            and isinstance(c.get("key"), str)
+        ):
+            factions.add(c["key"])
+    for c in candidates:
+        if not isinstance(c, dict):
+            raise ValueError("Invalid candidate")
+        kind = c.get("kind")
+        required = {"kind", "value", "evidence"}
+        if kind in ("state", "growth", "knowledge"):
+            required |= {"id", "key"}
+        elif kind == "memory":
+            required |= {"id", "known"}
+        elif kind in ("world_fact", "faction"):
+            required |= {"key"}
+        elif kind == "faction_relation":
+            required |= {"source", "target"}
+        elif kind != "world_event":
+            raise ValueError("Unsupported mutation kind")
+        if set(c) != required:
+            raise ValueError("Invalid candidate fields")
+        if "id" in c and (
+            not isinstance(c["id"], str) or c["id"] not in archive["characters"]
+        ):
+            raise ValueError("Unknown role")
+        if "key" in c:
+            checked_text(c["key"], 100, False)
+            if kind == "world_fact" and sum(name in c["key"] for name in factions) >= 2:
+                raise ValueError("Faction-pair facts must use faction_relation")
+        checked_text(c["value"], 4000, False)
+        quote = checked_text(c["evidence"], 4000, False)
+        if quote not in source:
+            raise ValueError("Evidence is absent from discarded history")
+        if kind == "memory" and type(c["known"]) is not bool:
+            raise ValueError("Knowledge must be boolean")
+        if kind == "faction_relation" and (
+            c["source"] not in factions
+            or c["target"] not in factions
+            or c["source"] == c["target"]
+        ):
+            raise ValueError("Macro relations require faction endpoints")
+        identity = (
+            kind,
+            c.get("id"),
+            c.get("key"),
+            c.get("source"),
+            c.get("target"),
+            c["value"] if kind in ("memory", "world_event") else None,
+        )
+        if identity in seen:
+            raise ValueError("Multiple proposals for the same fact")
+        seen.add(identity)
+    return candidates, summary
+
+
+def apply_candidates(archive, candidates, accepted):
+    """Apply approved atomic facts without rewriting any author's constraints.
+
+    Args:
+        archive: Existing archive.
+        candidates: Structurally validated proposals.
+        accepted: Approved proposal indices.
+
+    Returns:
+        Independent updated archive.
     """
     result = copy.deepcopy(archive)
-    active = data.get("active")
-    changes = data.get("changes")
-    if (
-        not isinstance(active, list)
-        or not all(
-            isinstance(key, str) and key in result["characters"] for key in active
-        )
-        or len(active) != len(set(active))
-    ):
-        raise ValueError("Invalid active character IDs")
-    if not isinstance(changes, list):
-        raise ValueError("Invalid character changes")
-    seen = set()
-    for change in changes:
-        if not isinstance(change, dict) or set(change) - {
-            "id",
-            "state",
-            "growth",
-            "memories",
-        }:
-            raise ValueError("Unsupported character mutation")
-        key = change.get("id")
-        if not isinstance(key, str) or key not in result["characters"] or key in seen:
-            raise ValueError("Invalid or duplicate changed character")
-        seen.add(key)
-        role = result["characters"][key]
-        for field in ("state", "growth"):
-            if field in change:
-                patch = change[field]
-                if not isinstance(patch, dict) or set(patch) != {"value", "evidence"}:
-                    raise ValueError("Invalid state patch")
-                quote = checked_text(patch["evidence"], 2000, False)
-                if quote not in evidence_source:
-                    raise ValueError("State evidence not found in narrative")
-                role[field] = checked_text(patch["value"])
-        memories = change.get("memories", [])
-        if not isinstance(memories, list) or len(memories) > 30:
-            raise ValueError("Invalid memory additions")
-        for memory in memories:
-            if not isinstance(memory, dict) or set(memory) != {
-                "text",
-                "known",
-                "evidence",
-            }:
-                raise ValueError("Invalid memory patch")
-            quote = checked_text(memory["evidence"], 2000, False)
-            if quote not in evidence_source or type(memory["known"]) is not bool:
-                raise ValueError("Invalid memory evidence or knowledge")
-            text = checked_text(memory["text"], 2000, False)
-            # Knowledge may become confirmed, but must never regress to unknown.
-            previous = next((m for m in role["memories"] if m["text"] == text), None)
+    # Add accepted faction definitions before their accepted relationships.
+    selected = [c for i, c in enumerate(candidates) if i in accepted]
+    selected.sort(key=lambda c: c["kind"] != "faction")
+    for c in selected:
+        kind = c["kind"]
+        if kind in ("state", "growth", "knowledge"):
+            result["characters"][c["id"]][kind][c["key"]] = c["value"]
+        elif kind == "memory":
+            memories = result["characters"][c["id"]]["memories"]
+            previous = next((m for m in memories if m["text"] == c["value"]), None)
             if previous:
-                previous["known"] = previous["known"] or memory["known"]
+                previous["known"] |= c["known"]
             else:
-                role["memories"].append({"text": text, "known": memory["known"]})
-    result["active"] = active
-    recall = data.get("recall", {})
-    if not isinstance(recall, dict) or set(recall) - set(result["characters"]):
-        raise ValueError("Invalid memory recall roles")
-    for key, indices in recall.items():
-        if (
-            not isinstance(indices, list)
-            or len(indices) > 12
-            or any(
-                type(index) is not int
-                or not 0 <= index < len(result["characters"][key]["memories"])
-                for index in indices
+                memories.append({"text": c["value"], "known": c["known"]})
+        elif kind in ("world_fact", "faction"):
+            result["worldbook"]["facts" if kind == "world_fact" else "factions"][
+                c["key"]
+            ] = c["value"]
+        elif kind == "world_event":
+            if c["value"] not in result["worldbook"]["events"]:
+                result["worldbook"]["events"].append(c["value"])
+        elif kind == "faction_relation":
+            book = result["worldbook"]
+            if (
+                c["source"] not in book["factions"]
+                or c["target"] not in book["factions"]
+            ):
+                continue
+            previous = next(
+                (
+                    r
+                    for r in book["relations"]
+                    if (r["source"], r["target"]) == (c["source"], c["target"])
+                ),
+                None,
             )
-        ):
-            raise ValueError("Invalid memory recall indices")
-    result["recall"] = recall
+            if previous:
+                previous["value"] = c["value"]
+            else:
+                book["relations"].append(
+                    {k: c[k] for k in ("source", "target", "value")}
+                )
     return result
 
 
-def render(archive: dict) -> str:
-    """Render the public setting and only active character dossiers.
+def relevant_indices(texts, query, limit):
+    """Retrieve relevant older facts with a bounded recent fallback, locally.
 
     Args:
-        archive: Validated scene archive.
+        texts: Stored fact strings.
+        query: Current scene text.
+        limit: Maximum records to inject.
 
     Returns:
-        System prompt replacement.
+        Selected indices in historical order.
     """
-    scene = {"world": archive["world"], "characters": {}}
-    for key in archive["active"]:
+    words = set(re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]{2}", query.lower()[:4000]))
+    ranked = sorted(
+        range(len(texts)),
+        key=lambda i: (sum(w in texts[i].lower() for w in words), i),
+        reverse=True,
+    )
+    return sorted(ranked[:limit])
+
+
+def render(archive, active=None, referenced=None, query=""):
+    """Inject fixed rules, relevant macro context, and selected role cards.
+
+    Args:
+        archive: Stored archive.
+        active: In-scene role IDs.
+        referenced: Relevant off-scene role IDs.
+        query: Scene text used for local memory retrieval.
+
+    Returns:
+        Persona replacement text.
+    """
+    active = archive.get("active", []) if active is None else active
+    referenced = [] if referenced is None else referenced
+    book = copy.deepcopy(archive["worldbook"])
+    names = list(book["factions"])
+    chosen = {
+        names[i]
+        for i in relevant_indices([n + book["factions"][n] for n in names], query, 6)
+    }
+    book["factions"] = {n: book["factions"][n] for n in names if n in chosen}
+    book["relations"] = [
+        r for r in book["relations"] if r["source"] in chosen or r["target"] in chosen
+    ]
+    book["events"] = [
+        book["events"][i] for i in relevant_indices(book["events"], query, 8)
+    ]
+    scene = {
+        "world": archive["world"],
+        "worldbook": book,
+        "characters": {},
+        "referenced": {},
+    }
+    for key in dict.fromkeys(active + referenced):
+        if key not in archive["characters"]:
+            continue
         role = copy.deepcopy(archive["characters"][key])
         memories = role["memories"]
-        indices = archive.get("recall", {}).get(
-            key, list(range(max(0, len(memories) - 8), len(memories)))
-        )
-        role["memories"] = [memories[index] for index in indices]
-        scene["characters"][key] = role
+        role["memories"] = [
+            memories[i]
+            for i in relevant_indices([m["text"] for m in memories], query, 12)
+        ]
+        scene["characters" if key in active else "referenced"][key] = role
     return INJECTION + json.dumps(scene, ensure_ascii=False)
 
 
 class ArchiveStore:
-    """Keep archives outside the plugin directory using atomic replacement."""
+    """Store isolated character and world archives atomically."""
 
     def __init__(self, directory: Path):
-        """Bind a plugin-owned data directory.
+        """Bind persistent storage.
 
         Args:
-            directory: Persistent AstrBot plugin data path.
+            directory: Plugin-owned data path.
         """
         self.directory = directory
         directory.mkdir(parents=True, exist_ok=True)
 
-    def path(self, scope: str) -> Path:
-        """Resolve an opaque filename without exposing session identifiers.
+    def path(self, scope):
+        """Resolve a safe opaque archive filename.
 
         Args:
-            scope: Session, conversation, and persona source identity.
+            scope: Conversation and persona identity.
 
         Returns:
-            JSON archive path.
+            Path to a JSON file.
         """
         return self.directory / (hashlib.sha256(scope.encode()).hexdigest() + ".json")
 
-    def load(self, scope: str) -> dict | None:
-        """Read an archive without treating corruption as an empty archive.
+    def load(self, scope):
+        """Load an archive and migrate old text fields without a network call.
 
         Args:
             scope: Archive identity.
 
         Returns:
-            Stored archive, or None when it has never been created.
+            Archive, or None if it does not exist.
 
         Raises:
-            ValueError: Archive format is invalid.
-            OSError: Reading fails for a reason other than a missing file.
+            ValueError: Corrupt or unsupported archive.
         """
         path = self.path(scope)
         if not path.exists():
             return None
-        data = parse_json(path.read_text(encoding="utf-8"))
-        if data.get("version") != 1 or not isinstance(data.get("characters"), dict):
-            raise ValueError("Unsupported archive format")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(data, dict)
+            or data.get("version") not in (1, 2)
+            or not isinstance(data.get("characters"), dict)
+        ):
+            raise ValueError("Unsupported archive")
+        if data["version"] == 1:
+            for role in data["characters"].values():
+                for field in ("state", "growth"):
+                    value = role.get(field, "")
+                    role[field] = {"既有记录": value} if value else {}
+                role["knowledge"] = {}
+                role["controller"] = "ai"
+            data["worldbook"] = {
+                "facts": {},
+                "factions": {},
+                "relations": [],
+                "events": [],
+            }
+            data["version"] = 2
+            data.pop("recall", None)
         return data
 
-    def save(self, scope: str, archive: dict) -> None:
-        """Atomically persist a whole archive after validation.
+    def save(self, scope, archive):
+        """Replace the archive atomically, keeping private file permissions.
 
         Args:
             scope: Archive identity.
-            archive: Validated character archive.
+            archive: Validated content.
         """
         path = self.path(scope)
         temporary = path.with_suffix(".tmp")
         try:
             temporary.write_text(
-                json.dumps({**archive, "version": 1}, ensure_ascii=False, indent=2),
+                json.dumps({**archive, "version": 2}, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
             temporary.chmod(0o600)

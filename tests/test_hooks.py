@@ -1,394 +1,603 @@
-"""Hook tests against the real AstrBot SDK with deterministic model results."""
+"""Real core compaction tests and narrow Jev/LLM routing regressions."""
 
 import asyncio
 import copy
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from astrbot.api.provider import (
+    DecisionBooleanAnswer,
     DecisionProvider,
     LLMResponse,
     Provider,
-    ProviderRequest,
 )
-from astrbot_plugin_living_characters.main import LivingCharacters
-from astrbot_plugin_living_characters.prompts import IMPORT
+from astrbot.core.agent.context.config import ContextConfig
+from astrbot.core.agent.context.manager import ContextManager
+from astrbot.core.agent.message import Message
+from astrbot_plugin_living_characters.bridge import CompressionBridge
+from astrbot_plugin_living_characters.prompts import COMPACT, DECISIONS, IMPORT
+from conftest import Event, request
 
 
-class Event:
-    unified_msg_origin = "test:group:one"
-
-    def __init__(self):
-        self.extras = {"_trace_persona_id": "story"}
-
-    def get_extra(self, key):
-        return self.extras.get(key)
-
-    def set_extra(self, key, value):
-        self.extras[key] = value
-
-
-SEED = {
-    "world": "医馆剧情",
-    "characters": [
-        {
-            "id": "r1",
-            "name": "A",
-            "core": "谨慎剑客",
-            "state": "腿伤未愈",
-            "growth": "",
-            "memories": [{"text": "曾在山路受伤", "known": True}],
-        },
-        {
-            "id": "r2",
-            "name": "B",
-            "core": "温和医师",
-            "state": "在别处出诊",
-            "growth": "",
-            "memories": [],
-        },
-    ],
-}
-
-
-@pytest.fixture
-def plugin(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        "astrbot_plugin_living_characters.main.StarTools.get_data_dir",
-        lambda *_: tmp_path,
+async def bound(plugin, manager, prompt="A独自在医馆"):
+    event, req = Event(), request(prompt)
+    await plugin.prepare_scene(event, req)
+    run = SimpleNamespace(
+        messages=[Message(role="system", content=req.system_prompt)],
+        context=SimpleNamespace(),
     )
-    ctx = SimpleNamespace(
-        persona_manager=SimpleNamespace(
-            get_persona_v3_by_id=lambda _: {
-                "prompt": "A是谨慎剑客，腿伤未愈。B是温和医师，外出出诊。"
-            }
+    runner = SimpleNamespace(run_context=run, request_context_manager=manager)
+    run.context._runtime = SimpleNamespace(
+        _sessions={"one": SimpleNamespace(_runner=runner)}
+    )
+    await plugin.bind_compression(event, run)
+    return event, req, run
+
+
+def old_and_recent(req, padding=""):
+    return [
+        Message(role="system", content=req.system_prompt),
+        Message(role="user", content="A接受治疗。" + padding),
+        Message(
+            role="assistant",
+            content="A的腿伤已经痊愈。A知道自己康复了。双方约定明日出发。",
         ),
-        get_current_chat_provider_id=AsyncMock(return_value="session-jev"),
-        get_provider_by_id=lambda _: None,
-        llm_generate=AsyncMock(),
-    )
-    p = LivingCharacters(ctx, {"decision_provider_id": ""})
-
-    async def generate(**kwargs):
-        if kwargs["system_prompt"] == IMPORT:
-            data = copy.deepcopy(SEED)
-        else:
-            payload = json.loads(kwargs["prompt"])
-            text = "\n".join(m["content"] for m in payload["new_evidence"])
-            data = {"active": ["r1"], "changes": []}
-            if "A的腿伤已经痊愈" in text:
-                data["changes"] = [
-                    {
-                        "id": "r1",
-                        "state": {"value": "腿伤痊愈", "evidence": "A的腿伤已经痊愈"},
-                        "memories": [
-                            {
-                                "text": "腿伤经治疗痊愈",
-                                "known": True,
-                                "evidence": "A的腿伤已经痊愈",
-                            }
-                        ],
-                    }
-                ]
-        return LLMResponse(
-            role="assistant", completion_text=json.dumps(data, ensure_ascii=False)
-        )
-
-    ctx.llm_generate.side_effect = generate
-    return p
+        Message(role="user", content="A在医馆喝茶"),
+        Message(role="assistant", content="A端起茶盏。"),
+        Message(role="user", content="继续"),
+    ]
 
 
-def request(cid="story-one", prompt="A在医馆休息"):
-    return ProviderRequest(
-        prompt=prompt,
-        contexts=[],
-        model="jev",
-        conversation=SimpleNamespace(cid=cid),
-        system_prompt="HOST SAFETY\n<persona_instructions>\nA是谨慎剑客，腿伤未愈。B是温和医师，外出出诊。\n</persona_instructions>\nHOST TOOLS",
-    )
-
-
-def test_default_provider_and_exact_prompt_replacement(plugin):
+def test_ordinary_turns_never_update_or_rewrite_archive(plugin):
     async def run():
         event, req = Event(), request()
         await plugin.prepare_scene(event, req)
-        assert req.system_prompt.startswith("HOST SAFETY\n<persona_instructions>\n")
-        assert req.system_prompt.endswith("\n</persona_instructions>\nHOST TOOLS")
+        turn = event.get_extra("living_characters_turn")
+        path = plugin.store.path(turn["scope"])
+        original = path.read_bytes()
+        assert req.system_prompt.startswith(
+            "HOST SAFETY"
+        ) and req.system_prompt.endswith("HOST TOOLS")
+        assert "原始完整人设" not in req.system_prompt
         assert "温和医师" not in req.system_prompt
-        assert all(
-            call.kwargs["chat_provider_id"] == "session-jev"
-            for call in plugin.context.llm_generate.call_args_list
-        )
-        assert all(
-            call.kwargs["model"] == "jev"
-            for call in plugin.context.llm_generate.call_args_list
-        )
-
-    asyncio.run(run())
-
-
-def test_completed_turn_survives_restart_and_compression(plugin):
-    async def run():
-        event, req = Event(), request()
-        await plugin.prepare_scene(event, req)
-        scope = event.get_extra("living_characters_turn")["scope"]
-        await plugin.save_growth(
+        await plugin.finish_run(
             event,
             SimpleNamespace(run_end_reason="completed"),
             LLMResponse(role="assistant", completion_text="A的腿伤已经痊愈"),
         )
-        saved = plugin.store.load(scope)
-        assert saved["characters"]["r1"]["state"] == "腿伤痊愈"
-        assert len(saved["characters"]["r1"]["memories"]) == 2
-        assert saved["revision"] == 1
-        # A new request no longer has the old history, simulating core compaction.
-        req = request(prompt="A回想起以前受伤的日子")
-        await plugin.prepare_scene(Event(), req)
-        assert "腿伤痊愈" in req.system_prompt
-        assert "曾在山路受伤" in req.system_prompt
-        assert "腿伤未愈" not in req.system_prompt
-
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize("reason", ["error", "cancelled", "max_steps"])
-def test_unsuccessful_turn_does_not_commit(plugin, reason):
-    async def run():
-        event = Event()
-        await plugin.prepare_scene(event, request())
-        scope = event.get_extra("living_characters_turn")["scope"]
-        before = plugin.store.load(scope)
-        await plugin.save_growth(
-            event,
-            SimpleNamespace(run_end_reason=reason),
-            LLMResponse(role="assistant", completion_text="A的腿伤已经痊愈"),
-        )
-        assert plugin.store.load(scope) == before
-
-    asyncio.run(run())
-
-
-def test_failed_save_has_durable_retry_before_next_compression(plugin):
-    async def run():
-        event = Event()
-        await plugin.prepare_scene(event, request())
-        scope = event.get_extra("living_characters_turn")["scope"]
-        working = plugin.context.llm_generate.side_effect
-        plugin.context.llm_generate.side_effect = TimeoutError(
-            "secret must not be logged"
-        )
-        await plugin.save_growth(
-            event,
-            SimpleNamespace(run_end_reason="completed"),
-            LLMResponse(role="assistant", completion_text="A的腿伤已经痊愈"),
-        )
-        pending = plugin.store.load(scope)
-        assert pending["characters"]["r1"]["state"] == "腿伤未愈"
-        assert pending["pending"][-1]["content"] == "A的腿伤已经痊愈"
-        plugin.context.llm_generate.side_effect = working
-        req = request(prompt="继续")
-        await plugin.prepare_scene(Event(), req)
-        saved = plugin.store.load(scope)
-        assert "pending" not in saved
-        assert saved["characters"]["r1"]["state"] == "腿伤痊愈"
-        assert "腿伤痊愈" in req.system_prompt
-
-    asyncio.run(run())
-
-
-def test_import_failure_preserves_full_original(plugin):
-    async def run():
-        plugin.context.llm_generate.side_effect = ValueError("bad json")
-        req = request()
-        original = req.system_prompt
-        await plugin.prepare_scene(Event(), req)
-        assert req.system_prompt == original
-        assert not list(plugin.store.directory.glob("*.json"))
-
-    asyncio.run(run())
-
-
-def test_dedicated_chat_provider_overrides_session(plugin):
-    async def run():
-        plugin.config["decision_provider_id"] = "dedicated"
-        provider = AsyncMock(spec=Provider)
-        plugin.context.get_provider_by_id = lambda _: provider
-        await plugin.prepare_scene(Event(), request())
+        assert path.read_bytes() == original
+        calls = plugin.context.llm_generate.await_count
+        for _ in range(3):
+            e = Event()
+            await plugin.prepare_scene(e, request("继续"))
+            await plugin.finish_run(e, None, None)
+        assert plugin.context.llm_generate.await_count == calls
+        assert path.read_bytes() == original
         assert all(
-            c.kwargs["chat_provider_id"] == "dedicated"
+            c.kwargs["system_prompt"] != COMPACT
             for c in plugin.context.llm_generate.call_args_list
         )
-        assert all(
-            "model" not in c.kwargs for c in plugin.context.llm_generate.call_args_list
-        )
-        plugin.context.get_current_chat_provider_id.assert_not_called()
 
     asyncio.run(run())
 
 
-def test_native_decision_provider_uses_session_llm_for_text(plugin):
-    from astrbot.api.provider import DecisionBooleanAnswer
-
+def test_native_scene_questions_are_atomic_and_have_no_full_dossiers(plugin):
     async def run():
-        plugin.config["decision_provider_id"] = "native-decision"
-        plugin.context.get_provider_by_id = lambda _: AsyncMock(spec=DecisionProvider)
+        plugin.config["decision_provider_id"] = "jev"
+        plugin.context.get_provider_by_id = lambda _: MagicMock(spec=DecisionProvider)
         plugin.context.decision = SimpleNamespace(
             ask=AsyncMock(
                 return_value={
-                    "r1": DecisionBooleanAnswer(0.9),
-                    "r2": DecisionBooleanAnswer(0.1),
+                    "r1:present": DecisionBooleanAnswer(0.95),
+                    "r1:referenced": DecisionBooleanAnswer(0.95),
+                    "r2:present": DecisionBooleanAnswer(0.05),
+                    "r2:referenced": DecisionBooleanAnswer(0.05),
                 }
             )
         )
         req = request()
         await plugin.prepare_scene(Event(), req)
+        assert plugin.context.llm_generate.await_count == 1
+        assert plugin.context.llm_generate.call_args.kwargs["system_prompt"] == IMPORT
+        call = plugin.context.decision.ask.call_args
+        assert set(call.args[0]) == {
+            "r1:present",
+            "r1:referenced",
+            "r2:present",
+            "r2:referenced",
+        }
+        assert "谨慎剑客" not in json.dumps(call.kwargs["state"], ensure_ascii=False)
         assert "温和医师" not in req.system_prompt
-        plugin.context.decision.ask.assert_awaited_once()
-        assert all(
-            c.kwargs["chat_provider_id"] == "session-jev"
-            for c in plugin.context.llm_generate.call_args_list
-        )
 
     asyncio.run(run())
 
 
-def test_new_conversation_uses_separate_archive(plugin):
+@pytest.mark.parametrize("strategy", ["turns", "tokens"])
+def test_actual_core_compaction_is_the_only_growth_trigger(plugin, strategy):
     async def run():
-        first, second = Event(), Event()
-        await plugin.prepare_scene(first, request("one"))
-        await plugin.prepare_scene(second, request("two"))
-        assert (
-            first.get_extra("living_characters_turn")["scope"]
-            != second.get_extra("living_characters_turn")["scope"]
-        )
-        assert len(list(plugin.store.directory.glob("*.json"))) == 2
-
-    asyncio.run(run())
-
-
-def test_real_core_compression_does_not_erase_character_state(plugin):
-    from astrbot.core.agent.context.config import ContextConfig
-    from astrbot.core.agent.context.manager import ContextManager
-    from astrbot.core.agent.message import Message
-
-    async def run():
-        event = Event()
-        await plugin.prepare_scene(event, request())
-        scope = event.get_extra("living_characters_turn")["scope"]
-        await plugin.save_growth(
-            event,
-            SimpleNamespace(run_end_reason="completed"),
-            LLMResponse(role="assistant", completion_text="A的腿伤已经痊愈"),
-        )
-        next_req = request(prompt="A在医馆喝茶")
-        await plugin.prepare_scene(Event(), next_req)
-        summary_provider = SimpleNamespace(
+        summary = SimpleNamespace(
             provider_config={},
             text_chat=AsyncMock(
                 return_value=LLMResponse(
-                    role="assistant", completion_text="故事发生在医馆。"
+                    role="assistant",
+                    completion_text="旧摘要：A的腿伤已经痊愈。明日出发。",
                 )
             ),
         )
         manager = ContextManager(
-            ContextConfig(
+            ContextConfig(enforce_max_turns=1, truncate_turns=1)
+            if strategy == "turns"
+            else ContextConfig(
                 max_context_tokens=3000,
-                llm_compress_provider=summary_provider,
+                llm_compress_provider=summary,
                 llm_compress_keep_recent_ratio=0.15,
             )
         )
-        messages = [
-            Message(role="system", content=next_req.system_prompt),
-            Message(role="user", content="早年的冒险。" * 10000),
-            Message(role="assistant", content="A的腿伤已经痊愈"),
-            Message(role="user", content="A在医馆喝茶"),
-        ]
-        compacted = await manager.process(messages)
-        summary_provider.text_chat.assert_awaited_once()
-        assert len(str(compacted)) < len(str(messages))
-        assert plugin.store.load(scope)["characters"]["r1"]["state"] == "腿伤痊愈"
-        after = request(prompt="A还记得受伤吗？")
-        after.contexts = [m.model_dump() for m in compacted if m.role != "system"]
-        await plugin.prepare_scene(Event(), after)
-        assert "腿伤痊愈" in after.system_prompt
-        assert "曾在山路受伤" in after.system_prompt
-        assert "腿伤未愈" not in after.system_prompt
+        original_class_method = ContextManager.process
+        event, req, context = await bound(plugin, manager)
+        turn = event.get_extra("living_characters_turn")
+        before = plugin.store.load(turn["scope"])
+        assert before["revision"] == 0
+        messages = old_and_recent(req, "背景。" * 12000 if strategy == "tokens" else "")
+        result = await manager.process(messages)
+        saved = plugin.store.load(turn["scope"])
+        assert saved["revision"] == 1
+        assert saved["characters"]["r1"]["state"]["腿伤"] == "已痊愈"
+        assert saved["characters"]["r1"]["state"]["位置"] == "医馆"
+        assert len(saved["characters"]["r1"]["memories"]) == 2
+        assert any("明日出发" in str(m.content) for m in result)
+        assert "腿伤已经痊愈" not in str(
+            [m.content for m in result if m.role != "system"]
+        )
+        assert "已痊愈" in result[0].content and "曾在山路受伤" in result[0].content
+        assert result[-1].content == "继续"
+        if strategy == "tokens":
+            summary.text_chat.assert_awaited_once()
+        assert ContextManager.process is original_class_method
+        await plugin.finish_run(event, context, None)
+        assert manager.process.__func__ is original_class_method
 
     asyncio.run(run())
 
 
-def test_scene_failure_on_first_turn_recovers_history_next_time(plugin):
+def test_under_threshold_no_extraction_and_no_archive_write(plugin):
     async def run():
+        manager = ContextManager(ContextConfig(max_context_tokens=100000))
+        event, req, _ = await bound(plugin, manager)
+        turn = event.get_extra("living_characters_turn")
+        path = plugin.store.path(turn["scope"])
+        snapshot = path.read_bytes()
+        plugin.context.llm_generate.reset_mock()
+        result = await manager.process(old_and_recent(req))
+        assert result[-1].content == "继续"
+        plugin.context.llm_generate.assert_not_called()
+        assert path.read_bytes() == snapshot
+
+    asyncio.run(run())
+
+
+def test_compaction_failure_keeps_full_history_and_old_archive(plugin):
+    async def run():
+        manager = ContextManager(ContextConfig(enforce_max_turns=1))
+        event, req, _ = await bound(plugin, manager)
+        turn = event.get_extra("living_characters_turn")
+        path = plugin.store.path(turn["scope"])
+        snapshot = path.read_bytes()
+        plugin.context.llm_generate.side_effect = TimeoutError(
+            "credentials must not be logged"
+        )
+        messages = old_and_recent(req)
+        result = await manager.process(messages)
+        assert [m.model_dump() for m in result] == [m.model_dump() for m in messages]
+        assert path.read_bytes() == snapshot
+
+    asyncio.run(run())
+
+
+def test_retained_history_is_not_archived_ahead_of_time(plugin):
+    async def run():
+        manager = ContextManager(ContextConfig(enforce_max_turns=2))
+        event, req, _ = await bound(plugin, manager)
+        # The quoted cure now occurs only in a retained round, not removed history.
+        messages = [
+            Message(role="system", content=req.system_prompt),
+            Message(role="user", content="早前的闲谈"),
+            Message(role="assistant", content="天气不错"),
+            Message(role="user", content="另一段旧闲谈"),
+            Message(role="assistant", content="仍然没有新事件"),
+            Message(role="user", content="A的腿伤已经痊愈"),
+            Message(role="assistant", content="A走动"),
+            Message(role="user", content="继续"),
+        ]
+        result = await manager.process(messages)
+        assert [m.model_dump() for m in result] == [m.model_dump() for m in messages]
+        assert (
+            plugin.store.load(event.get_extra("living_characters_turn")["scope"])[
+                "revision"
+            ]
+            == 0
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"answers": {"one": "true"}},
+        {"answers": {"extra": True}},
+        {"answers": {"one": 1}},
+        {"answers": {"one": True}, "explanation": "bad"},
+    ],
+)
+def test_llm_json_fallback_is_strict(plugin, bad):
+    async def run():
+        plugin.context.llm_generate.side_effect = None
+        plugin.context.llm_generate.return_value = LLMResponse(
+            role="assistant", completion_text=json.dumps(bad)
+        )
+        with pytest.raises(ValueError):
+            await plugin.decide(Event(), {"one": "唯一命题？"}, {})
+
+    asyncio.run(run())
+
+
+def test_missing_jev_uses_current_session_json_model(plugin):
+    async def run():
+        result = await plugin.decide(Event(), {"fact": "事实成立？"}, {})
+        assert result == {"fact": True}
+        assert (
+            plugin.context.llm_generate.call_args.kwargs["chat_provider_id"]
+            == "session-provider"
+        )
+        assert (
+            plugin.context.llm_generate.call_args.kwargs["system_prompt"] == DECISIONS
+        )
+
+    asyncio.run(run())
+
+
+def test_dedicated_chat_provider_is_supported(plugin):
+    async def run():
+        plugin.config["decision_provider_id"] = "dedicated-chat"
+        plugin.context.get_provider_by_id = lambda _: MagicMock(spec=Provider)
+        await plugin.decide(Event(), {"fact": "事实成立？"}, {}, "session-model")
+        assert (
+            plugin.context.llm_generate.call_args.kwargs["chat_provider_id"]
+            == "dedicated-chat"
+        )
+        assert "model" not in plugin.context.llm_generate.call_args.kwargs
+
+    asyncio.run(run())
+
+
+def test_atomic_verification_checks_each_mutation_separately(plugin):
+    async def run():
+        manager = ContextManager(ContextConfig(enforce_max_turns=1))
+        event, req, _ = await bound(plugin, manager)
+        await manager.process(old_and_recent(req))
+        decisions = [
+            json.loads(c.kwargs["prompt"])["questions"]
+            for c in plugin.context.llm_generate.call_args_list
+            if c.kwargs["system_prompt"] == DECISIONS
+        ]
+        verification = decisions[-1]
+        assert set(verification) == {
+            "c0:supported",
+            "c0:actual",
+            "c0:violates",
+            "c0:current",
+            "c1:supported",
+            "c1:actual",
+            "c1:violates",
+            "c1:known",
+        }
+
+    asyncio.run(run())
+
+
+def test_private_knowledge_does_not_spread_implicitly(plugin):
+    async def run():
+        manager = ContextManager(ContextConfig(enforce_max_turns=1))
+        event, req, _ = await bound(plugin, manager)
+        turn = event.get_extra("living_characters_turn")
+        await manager.process(old_and_recent(req))
+        saved = plugin.store.load(turn["scope"])
+        assert saved["characters"]["r1"]["knowledge"]["救命者"] == "不知道是谁"
+        assert saved["characters"]["r2"]["knowledge"]["救命者"] == "知道自己曾暗中救A"
+
+    asyncio.run(run())
+
+
+def test_rejected_hard_constraint_cannot_rewrite_core(plugin):
+    async def run():
+        manager = ContextManager(ContextConfig(enforce_max_turns=1))
+        event, req, _ = await bound(plugin, manager)
         working = plugin.context.llm_generate.side_effect
 
-        async def fail_scene(**kwargs):
-            if kwargs["system_prompt"] == IMPORT:
-                return await working(**kwargs)
-            raise TimeoutError()
+        async def reject(**kwargs):
+            response = await working(**kwargs)
+            if kwargs["system_prompt"] == DECISIONS:
+                data = json.loads(response.completion_text)
+                if "c0:violates" in data["answers"]:
+                    data["answers"]["c0:violates"] = True
+                    response.completion_text = json.dumps(data)
+            return response
 
-        plugin.context.llm_generate.side_effect = fail_scene
-        req = request()
-        original = req.system_prompt
-        await plugin.prepare_scene(Event(), req)
-        assert req.system_prompt == original
-        plugin.context.llm_generate.side_effect = working
-        next_req = request(prompt="继续")
-        next_req.contexts = [{"role": "assistant", "content": "A的腿伤已经痊愈"}]
-        await plugin.prepare_scene(Event(), next_req)
-        assert "腿伤痊愈" in next_req.system_prompt
-        assert "腿伤未愈" not in next_req.system_prompt
+        plugin.context.llm_generate.side_effect = reject
+        await manager.process(old_and_recent(req))
+        saved = plugin.store.load(event.get_extra("living_characters_turn")["scope"])
+        assert saved["characters"]["r1"]["state"]["腿伤"] == "未愈"
+        assert "无法恢复" in saved["characters"]["r1"]["core"]
 
     asyncio.run(run())
 
 
-def test_old_context_is_not_accepted_as_new_change_evidence(plugin):
+def test_scene_switch_loads_role_but_does_not_grow_archive(plugin):
     async def run():
         event = Event()
         await plugin.prepare_scene(event, request())
-        await plugin.save_growth(
-            event,
-            SimpleNamespace(run_end_reason="completed"),
-            LLMResponse(role="assistant", completion_text="A的腿伤已经痊愈"),
-        )
+        path = plugin.store.path(event.get_extra("living_characters_turn")["scope"])
+        snapshot = path.read_bytes()
+        working = plugin.context.llm_generate.side_effect
 
-        async def replay_old_injury(**kwargs):
-            return LLMResponse(
-                role="assistant",
-                completion_text=json.dumps(
-                    {
-                        "active": ["r1"],
-                        "changes": [
-                            {
-                                "id": "r1",
-                                "state": {
-                                    "value": "腿伤未愈",
-                                    "evidence": "A在多年前腿部受伤",
-                                },
+        async def switch(**kwargs):
+            if kwargs["system_prompt"] == DECISIONS:
+                return LLMResponse(
+                    role="assistant",
+                    completion_text=json.dumps(
+                        {
+                            "answers": {
+                                "r1:present": False,
+                                "r1:referenced": False,
+                                "r2:present": True,
+                                "r2:referenced": True,
                             }
-                        ],
-                    }
-                ),
-            )
+                        }
+                    ),
+                )
+            return await working(**kwargs)
 
-        plugin.context.llm_generate.side_effect = replay_old_injury
-        next_req = request(prompt="A喝茶")
-        next_req.contexts = [{"role": "user", "content": "A在多年前腿部受伤"}]
-        await plugin.prepare_scene(Event(), next_req)
-        assert "腿伤痊愈" in next_req.system_prompt
-        assert "腿伤未愈" not in next_req.system_prompt
+        plugin.context.llm_generate.side_effect = switch
+        req = request("镜头转到B")
+        await plugin.prepare_scene(Event(), req)
+        assert "温和医师" in req.system_prompt
+        assert "谨慎剑客" not in req.system_prompt
+        assert path.read_bytes() == snapshot
 
     asyncio.run(run())
 
 
-def test_host_metadata_accepts_current_prerelease():
-    from pathlib import Path
+def test_unknown_runtime_restores_original_persona_and_preserves_tools(plugin):
+    async def run():
+        event, req = Event(), request()
+        original = req.system_prompt
+        await plugin.prepare_scene(event, req)
+        context = SimpleNamespace(
+            context=SimpleNamespace(),
+            messages=[Message(role="system", content=req.system_prompt)],
+        )
+        await plugin.bind_compression(event, context)
+        assert req.system_prompt == original
+        assert context.messages[0].content == original
 
-    from astrbot.core.star.star_manager import PluginManager
+    asyncio.run(run())
 
-    metadata = PluginManager._load_plugin_metadata(str(Path(__file__).parents[1]))
-    assert metadata.name == "astrbot_plugin_living_characters"
-    assert PluginManager._validate_astrbot_version_specifier(metadata.astrbot_version)[
-        0
-    ]
+
+def test_adapter_is_per_instance_and_restored_on_unload(plugin):
+    async def run():
+        first, other = ContextManager(ContextConfig()), ContextManager(ContextConfig())
+        await bound(plugin, first)
+        assert first.process.__self__.__class__ is CompressionBridge
+        assert other.process.__func__ is ContextManager.process
+        await plugin.terminate()
+        assert first.process.__func__ is ContextManager.process
+
+    asyncio.run(run())
+
+
+def test_archive_scopes_separate_conversations_and_inherited_personas(plugin):
+    async def run():
+        first, second = Event(), Event()
+        await plugin.prepare_scene(first, request(cid="one"))
+        await plugin.prepare_scene(second, request(cid="two"))
+        assert (
+            first.get_extra("living_characters_turn")["scope"]
+            != second.get_extra("living_characters_turn")["scope"]
+        )
+
+    asyncio.run(run())
+
+
+def test_native_uncertainty_keeps_previous_scene(plugin):
+    async def run():
+        event = Event()
+        await plugin.prepare_scene(event, request())
+        plugin.config["decision_provider_id"] = "jev"
+        plugin.context.get_provider_by_id = lambda _: MagicMock(spec=DecisionProvider)
+        plugin.context.decision = SimpleNamespace(
+            ask=AsyncMock(
+                return_value={
+                    "r1:present": DecisionBooleanAnswer(0.5),
+                    "r1:referenced": DecisionBooleanAnswer(0.2),
+                    "r2:present": DecisionBooleanAnswer(0.5),
+                    "r2:referenced": DecisionBooleanAnswer(0.2),
+                }
+            )
+        )
+        req = request("场景继续")
+        await plugin.prepare_scene(Event(), req)
+        assert "谨慎剑客" in req.system_prompt and "温和医师" not in req.system_prompt
+
+    asyncio.run(run())
+
+
+def test_worldbook_growth_is_committed_only_with_real_compaction(plugin):
+    async def run():
+        plugin.test_proposals = {
+            "candidates": [
+                {
+                    "kind": "faction_relation",
+                    "source": "北盟",
+                    "target": "南盟",
+                    "value": "结盟",
+                    "evidence": "北盟与南盟结盟",
+                },
+                {
+                    "id": "r1",
+                    "kind": "state",
+                    "key": "对B关系",
+                    "value": "仍不信任",
+                    "evidence": "A仍不信任B",
+                },
+            ],
+            "shared_summary": "两盟已结盟，私人关系尚待缓和。",
+        }
+        manager = ContextManager(ContextConfig(enforce_max_turns=1))
+        event, req, _ = await bound(plugin, manager)
+        scope = event.get_extra("living_characters_turn")["scope"]
+        assert plugin.store.load(scope)["worldbook"]["relations"][0]["value"] == "敌对"
+        messages = old_and_recent(req)
+        messages[1].content = "北盟与南盟结盟，但A仍不信任B。"
+        messages[2].content = "两盟完成签约。"
+        await manager.process(messages)
+        saved = plugin.store.load(scope)
+        assert saved["worldbook"]["relations"][0]["value"] == "结盟"
+        assert saved["characters"]["r1"]["state"]["对B关系"] == "仍不信任"
+
+    asyncio.run(run())
+
+
+def test_assistant_cannot_author_player_state_changes(plugin):
+    async def run():
+        manager = ContextManager(ContextConfig(enforce_max_turns=1))
+        event, req, _ = await bound(plugin, manager)
+        scope = event.get_extra("living_characters_turn")["scope"]
+        archive = plugin.store.load(scope)
+        archive["characters"]["r1"]["controller"] = "user"
+        plugin.store.save(scope, archive)
+        # Even if a model mistakenly approves it, the evidence is exclusively
+        # assistant-authored, so player control is protected deterministically.
+        await manager.process(old_and_recent(req))
+        saved = plugin.store.load(scope)
+        assert (
+            saved["characters"]["r1"]["state"] == archive["characters"]["r1"]["state"]
+        )
+        assert (
+            saved["characters"]["r1"]["memories"]
+            == archive["characters"]["r1"]["memories"]
+        )
+        assert "未归档" in saved["shared_summary"]
+
+    asyncio.run(run())
+
+
+def test_native_no_change_screen_skips_expensive_archive_llm(plugin):
+    async def run():
+        manager = ContextManager(ContextConfig(enforce_max_turns=1))
+        event, req, _ = await bound(plugin, manager)
+        scope = event.get_extra("living_characters_turn")["scope"]
+        snapshot = plugin.store.path(scope).read_bytes()
+        plugin.config["decision_provider_id"] = "jev"
+        plugin.context.get_provider_by_id = lambda _: MagicMock(spec=DecisionProvider)
+        plugin.context.decision = SimpleNamespace(
+            ask=AsyncMock(return_value={"has_changes": DecisionBooleanAnswer(0.01)})
+        )
+        plugin.context.llm_generate.reset_mock()
+        await manager.process(old_and_recent(req))
+        plugin.context.llm_generate.assert_not_called()
+        assert plugin.store.path(scope).read_bytes() == snapshot
+
+    asyncio.run(run())
+
+
+def test_only_uncertain_native_checks_escalate_to_llm_json(plugin):
+    async def run():
+        plugin.config["decision_provider_id"] = "jev"
+        plugin.context.get_provider_by_id = lambda _: MagicMock(spec=DecisionProvider)
+        plugin.context.decision = SimpleNamespace(
+            ask=AsyncMock(
+                return_value={
+                    "sure": DecisionBooleanAnswer(0.95),
+                    "uncertain": DecisionBooleanAnswer(0.5),
+                    "negative": DecisionBooleanAnswer(0.05),
+                }
+            )
+        )
+        result = await plugin.decide(
+            Event(),
+            {
+                "sure": "明确事实？",
+                "uncertain": "不确定事实？",
+                "negative": "不成立的事实？",
+            },
+            {},
+            resolve_uncertain=True,
+        )
+        assert result == {"sure": True, "uncertain": True, "negative": False}
+        payload = json.loads(plugin.context.llm_generate.call_args.kwargs["prompt"])
+        assert set(payload["questions"]) == {"uncertain"}
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("alter_value", [False, True])
+def test_structural_json_repair_cannot_change_fact_content(plugin, alter_value):
+    from astrbot_plugin_living_characters.prompts import REPAIR
+
+    async def run():
+        plugin.test_proposals = {
+            "candidates": [
+                {
+                    "id": "world",
+                    "kind": "world_fact",
+                    "key": "时代",
+                    "value": "旧历二年",
+                    "evidence": "进入旧历二年",
+                }
+            ],
+            "shared_summary": "新的年份，剧情继续。",
+        }
+        manager = ContextManager(ContextConfig(enforce_max_turns=1))
+        event, req, _ = await bound(plugin, manager)
+        scope = event.get_extra("living_characters_turn")["scope"]
+        working = plugin.context.llm_generate.side_effect
+
+        async def repair(**kwargs):
+            if kwargs["system_prompt"] == REPAIR:
+                fixed = copy.deepcopy(plugin.test_proposals)
+                fixed["candidates"][0].pop("id")
+                if alter_value:
+                    fixed["candidates"][0]["value"] = "编造的年份"
+                return LLMResponse(role="assistant", completion_text=json.dumps(fixed))
+            return await working(**kwargs)
+
+        plugin.context.llm_generate.side_effect = repair
+        messages = old_and_recent(req)
+        messages[1].content = "时间进入旧历二年"
+        await manager.process(messages)
+        saved = plugin.store.load(scope)
+        assert saved["worldbook"]["facts"]["时代"] == (
+            "旧历元年" if alter_value else "旧历二年"
+        )
+
+    asyncio.run(run())
+
+
+def test_repeated_compaction_snapshot_is_idempotent(plugin):
+    async def run():
+        manager = ContextManager(ContextConfig(enforce_max_turns=1))
+        event, req, _ = await bound(plugin, manager)
+        messages = old_and_recent(req)
+        await manager.process(messages)
+        scope = event.get_extra("living_characters_turn")["scope"]
+        first = plugin.store.load(scope)
+        plugin.context.llm_generate.reset_mock()
+        await manager.process(messages)
+        assert plugin.store.load(scope)["revision"] == first["revision"]
+        assert plugin.store.load(scope)["characters"] == first["characters"]
+        plugin.context.llm_generate.assert_not_called()
+
+    asyncio.run(run())
