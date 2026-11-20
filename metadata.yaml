@@ -1,0 +1,7 @@
+name: astrbot_plugin_living_characters
+display_name: 成长角色档案
+desc: 按场景加载角色人设，随剧情维护状态、经历和成长。
+version: v0.1.0
+author: AGTHESHY
+astrbot_version: ">=4.30.0.dev0,<5"
+repo: https://github.com/AGTHESHY/LigthingYouAi

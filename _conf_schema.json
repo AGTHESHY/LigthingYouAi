@@ -1,0 +1,8 @@
+{
+  "decision_provider_id": {
+    "description": "决策模型（可选）",
+    "type": "string",
+    "default": "",
+    "hint": "填写 AstrBot 已配置的模型提供商 ID，留空使用当前会话模型。可填写聊天模型负责全部整理；若填写原生决策模型，则只用于在场判断，档案文字仍由当前会话模型整理。"
+  }
+}

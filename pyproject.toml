@@ -1,0 +1,7 @@
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["F", "W", "E", "ASYNC", "C4", "Q", "I", "UP"]
+ignore = ["E501", "ASYNC230", "ASYNC240"]
