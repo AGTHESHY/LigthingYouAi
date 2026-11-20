@@ -148,7 +148,8 @@ function renderEditor() {
   $("edit-note").hidden = !state.editing;
   const sections = [];
   if (isWorld) {
-    sections.push(card("世界背景与固定规则", "作者设定的长期规则、叙事方式与用户控制权。只有你手动修改时才会改变。", [field("世界规则", data.world, (value) => { data.world = value; }, { long: true })], node("span", { class: "pill", text: "固定设定" })));
+    if (data.world_base) sections.push(card("基础世界背景", "保留导入时的背景原文，当前世界状态可随剧情继续推进。", [field("基础世界背景原文", data.world_base, (value) => { data.world_base = value; }, { long: true })]));
+    if (data.world || state.editing) sections.push(card("世界背景与固定规则", "作者设定的长期规则、叙事方式与用户控制权。只有你手动修改时才会改变。", [field("世界规则", data.world, (value) => { data.world = value; }, { long: true, required: false })], node("span", { class: "pill", text: "固定设定" })));
     sections.push(mapEditor("世界状态", "当前年份、时代局势等会随故事推进的宏观事实。", data.worldbook, "facts"));
     sections.push(mapEditor("势力档案", "记录各个组织的现状、资源与宏观目标。", data.worldbook, "factions"));
     sections.push(relationsEditor(data.worldbook));
@@ -161,7 +162,8 @@ function renderEditor() {
     const controller = node("select", { value: role.controller, disabled: !state.editing, onchange: (event) => { role.controller = event.target.value; dirty(); } }, [node("option", { value: "ai", text: "AI 演绎" }), node("option", { value: "user", text: "用户独占控制" })]);
     controller.value = role.controller;
     sections.push(card("角色身份", "用户控制的角色只记录档案，AI 不会因此获得代写权限。", [node("div", { class: "two-columns" }, [field("角色名称", role.name, (value) => { role.name = value; }, { input: true }), node("label", { class: "field" }, [node("span", { class: "field-label", text: "控制方式" }), controller])])]));
-    sections.push(card("核心设定", "稳定身份、性格底线、外貌、永久特征与绝对禁忌。", [field("角色核心", role.core, (value) => { role.core = value; }, { long: true })], node("span", { class: "pill", text: "固定设定" })));
+    if (role.base) sections.push(card("基础角色设定", "保留导入的设定原文；其中的初始状态由后续剧情和结构化状态更新。", [field("基础角色设定原文", role.base, (value) => { role.base = value; }, { long: true })]));
+    if (role.core || state.editing) sections.push(card("核心设定", "稳定身份、性格底线、外貌、永久特征与绝对禁忌。", [field("角色核心", role.core, (value) => { role.core = value; }, { long: true, required: !role.base })], node("span", { class: "pill", text: "固定设定" })));
     sections.push(mapEditor("当前状态", "身体、位置与人物之间的私人关系。", role, "state"));
     sections.push(mapEditor("角色认知", "这个角色知道、误信或不知道的事，与世界客观事实区分。", role, "knowledge"));
     sections.push(mapEditor("性格成长", "有剧情依据的持久变化，不会自动抹去角色底色。", role, "growth"));

@@ -25,6 +25,7 @@ from .engine import (
     render,
     validate_candidates,
 )
+from .importer import parse_marked_persona
 from .prompts import COMPACT, DECISIONS, IMPORT, REPAIR
 from .webui import ArchiveWebAPI
 
@@ -275,11 +276,13 @@ class LivingCharacters(Star):
             try:
                 archive = self.store.load(scope)
                 if archive is None:
-                    archive = new_archive(
-                        await self.analyze(
-                            event, IMPORT, {"persona": original}, req.model
+                    archive = parse_marked_persona(original)
+                    if archive is None:
+                        archive = new_archive(
+                            await self.analyze(
+                                event, IMPORT, {"persona": original}, req.model
+                            )
                         )
-                    )
                     archive["label"] = {
                         "title": str(
                             event.get_extra("_trace_persona_id") or "剧情档案"
@@ -421,9 +424,9 @@ class LivingCharacters(Star):
                 f"原文「{c['evidence']}」描述的是实际发生的事件吗？假设、计划、否定和纯回忆不算。"
             )
             questions[f"c{i}:violates"] = (
-                f"作者固定规则是否明确禁止「{label}」这项变化？只检查world_rules和该角色core；before_state与before_worldbook的旧状态不是禁令。"
+                f"作者固定规则（含base原文中明确的永久约束）是否明确禁止「{label}」这项变化？只检查world_rules和该角色core；before_state与before_worldbook的旧状态不是禁令。"
                 if "id" in c
-                else f"world_rules中是否存在明确禁止「{label}」这项宏观变化的永久规则？before_worldbook中的旧局势允许随剧情改变。"
+                else f"world_rules或world_base中是否存在明确禁止「{label}」这项宏观变化的永久规则？before_worldbook中的旧局势允许随剧情改变。"
             )
             if c["kind"] in (
                 "state",
@@ -454,10 +457,12 @@ class LivingCharacters(Star):
             questions,
             {
                 "world_rules": archive["world"],
+                "world_base": archive.get("world_base", ""),
                 "characters": {
                     k: {
                         "name": r["name"],
                         "core": r["core"],
+                        "base": r.get("base", ""),
                         "before_state": r["state"],
                         "before_knowledge": r["knowledge"],
                     }

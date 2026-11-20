@@ -321,3 +321,41 @@ def test_saved_edits_are_used_by_next_chat_without_reimport(plugin):
         )
 
     asyncio.run(run())
+
+
+def test_rule_imported_base_text_can_be_read_edited_and_reused(plugin):
+    from conftest import Event, request
+
+    async def run():
+        source = "【世界背景】山中医馆【角色名】A【角色设定】谨慎的剑客，初始受伤。"
+        plugin.context.persona_manager.get_persona_v3_by_id = lambda _: {
+            "prompt": source
+        }
+        req = request()
+        req.system_prompt = (
+            "\n<persona_instructions>\n" + source + "\n</persona_instructions>\n"
+        )
+        event = Event()
+        await plugin.prepare_scene(event, req)
+        archive_id = plugin.store.path(
+            event.get_extra("living_characters_turn")["scope"]
+        ).stem
+        with bound_request():
+            loaded = decoded(await plugin.webui.get_archive(archive_id))
+        assert loaded["document"]["world"] == ""
+        assert loaded["document"]["world_base"] == "山中医馆"
+        assert loaded["document"]["characters"][0]["base"] == "谨慎的剑客，初始受伤。"
+        payload = {key: loaded[key] for key in ("revision", "title", "document")}
+        payload["document"]["world_base"] = "山中医馆与山下集市"
+        payload["document"]["characters"][0]["base"] = "作者修订的基础设定。"
+        with bound_request(payload):
+            assert (await plugin.webui.save_archive(archive_id)).status_code == 200
+        next_req = request()
+        next_req.system_prompt = (
+            "\n<persona_instructions>\n" + source + "\n</persona_instructions>\n"
+        )
+        await plugin.prepare_scene(Event(), next_req)
+        assert "山中医馆与山下集市" in next_req.system_prompt
+        assert "作者修订的基础设定" in next_req.system_prompt
+
+    asyncio.run(run())

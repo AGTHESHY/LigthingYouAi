@@ -89,9 +89,15 @@ def new_archive(data):
     Raises:
         ValueError: Import fields are invalid.
     """
-    if set(data) != {"world", "worldbook", "characters"}:
+    if not {"world", "worldbook", "characters"} <= set(data) or set(data) - {
+        "world",
+        "worldbook",
+        "characters",
+        "world_base",
+    }:
         raise ValueError("Invalid import fields")
-    world = checked_text(data["world"], 32000, False)
+    world_base = checked_text(data.get("world_base", ""), 32000)
+    world = checked_text(data["world"], 32000)
     book = data["worldbook"]
     if not isinstance(book, dict) or set(book) != {
         "facts",
@@ -144,7 +150,7 @@ def new_archive(data):
     for index, role in enumerate(roles, 1):
         if (
             not isinstance(role, dict)
-            or set(role)
+            or set(role) - {"base"}
             != {
                 "id",
                 "name",
@@ -178,12 +184,18 @@ def new_archive(data):
         result["characters"][role["id"]] = {
             "name": name,
             "controller": role["controller"],
-            "core": checked_text(role["core"], 16000, False),
+            "core": checked_text(role["core"], 16000, bool(role.get("base"))),
             "state": text_map(role["state"]),
             "growth": text_map(role["growth"]),
             "knowledge": text_map(role["knowledge"]),
             "memories": copy.deepcopy(memories),
         }
+        if "base" in role:
+            result["characters"][role["id"]]["base"] = checked_text(
+                role["base"], 16000, False
+            )
+    if world_base:
+        result["world_base"] = world_base
     return result
 
 
@@ -379,6 +391,8 @@ def render(archive, active=None, referenced=None, query=""):
         "characters": {},
         "referenced": {},
     }
+    if archive.get("world_base"):
+        scene["world_base"] = archive["world_base"]
     for key in dict.fromkeys(active + referenced):
         if key not in archive["characters"]:
             continue

@@ -99,6 +99,8 @@ class ArchiveWebAPI:
                     {"id": key, **role} for key, role in archive["characters"].items()
                 ],
             }
+            if archive.get("world_base"):
+                document["world_base"] = archive["world_base"]
             # Stored files are validated before they can enter an edit session.
             new_archive(document)
             return json_response(
@@ -156,6 +158,10 @@ class ArchiveWebAPI:
                 updated = copy.deepcopy(current)
                 for key in ("world", "worldbook", "characters"):
                     updated[key] = validated[key]
+                if "world_base" in validated:
+                    updated["world_base"] = validated["world_base"]
+                else:
+                    updated.pop("world_base", None)
                 updated.setdefault("label", {})["title"] = title
                 updated["revision"] += 1
                 updated.pop("compaction_id", None)
