@@ -251,9 +251,14 @@ class LivingCharacters(Star):
         original = selected.get("prompt") if selected else None
         if not original:
             return
-        wrapped = f"\n<persona_instructions>\n{original}\n</persona_instructions>\n"
-        if (req.system_prompt or "").count(wrapped) != 1:
+        wrappers = (
+            f"\n<persona_instructions>\n{original}\n</persona_instructions>\n",
+            f"\n# Persona Instructions\n\n{original}\n",
+        )
+        matches = [w for w in wrappers if (req.system_prompt or "").count(w) == 1]
+        if len(matches) != 1:
             return
+        wrapped = matches[0]
         prefix, suffix = req.system_prompt.split(wrapped)
         scope = json.dumps(
             [
@@ -336,6 +341,25 @@ class LivingCharacters(Star):
             ),
             None,
         )
+        if runner is None and runtime is None:
+            # AstrBot 4.29.4 registers the native runner before on_agent_begin.
+            # Require exact request, context, and event identities so another
+            # session or follow-up cannot attach to the wrong manager.
+            try:
+                from astrbot.core.pipeline.process_stage.follow_up import (
+                    _ACTIVE_AGENT_RUNNERS,
+                )
+            except ImportError:
+                pass
+            else:
+                candidate = _ACTIVE_AGENT_RUNNERS.get(event.unified_msg_origin)
+                if (
+                    candidate is not None
+                    and candidate.run_context is run_context
+                    and getattr(candidate, "req", None) is turn["request"]
+                    and getattr(run_context.context, "event", None) is event
+                ):
+                    runner = candidate
         if runner is None or not hasattr(
             getattr(runner, "request_context_manager", None), "process"
         ):
