@@ -7,7 +7,7 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -113,6 +113,8 @@ def plugin(tmp_path, monkeypatch):
         lambda *_: tmp_path,
     )
     ctx = SimpleNamespace(
+        register_web_api=MagicMock(),
+        registered_web_apis=[],
         persona_manager=SimpleNamespace(
             get_persona_v3_by_id=lambda _: {"prompt": "原始完整人设"}
         ),

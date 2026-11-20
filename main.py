@@ -26,6 +26,7 @@ from .engine import (
     validate_candidates,
 )
 from .prompts import COMPACT, DECISIONS, IMPORT, REPAIR
+from .webui import ArchiveWebAPI
 
 
 class LivingCharacters(Star):
@@ -46,6 +47,7 @@ class LivingCharacters(Star):
         self.locks = weakref.WeakValueDictionary()
         self.scenes = {}
         self.bridges = set()
+        self.webui = ArchiveWebAPI(self)
 
     async def analyze(self, event, instruction, payload, model=None):
         """Use the selected chat model for JSON, never for ordinary growth ticks.
@@ -268,7 +270,7 @@ class LivingCharacters(Star):
                 hashlib.sha256(original.encode()).hexdigest(),
             ]
         )
-        lock = self.locks.setdefault(scope, asyncio.Lock())
+        lock = self.locks.setdefault(self.store.path(scope).stem, asyncio.Lock())
         async with lock:
             try:
                 archive = self.store.load(scope)
@@ -278,6 +280,13 @@ class LivingCharacters(Star):
                             event, IMPORT, {"persona": original}, req.model
                         )
                     )
+                    archive["label"] = {
+                        "title": str(
+                            event.get_extra("_trace_persona_id") or "剧情档案"
+                        ),
+                        "conversation": str(req.conversation.cid),
+                        "origin": event.unified_msg_origin,
+                    }
                     self.store.save(scope, archive)
                 history = []
                 for item in req.contexts:
@@ -500,7 +509,9 @@ class LivingCharacters(Star):
             Compact public context, or untouched history on archival failure.
         """
         removed = narrative(discarded)
-        lock = self.locks.setdefault(turn["scope"], asyncio.Lock())
+        lock = self.locks.setdefault(
+            self.store.path(turn["scope"]).stem, asyncio.Lock()
+        )
         async with lock:
             try:
                 archive = self.store.load(turn["scope"])
@@ -674,3 +685,4 @@ class LivingCharacters(Star):
             bridge.close()
         self.bridges.clear()
         self.scenes.clear()
+        self.webui.close()

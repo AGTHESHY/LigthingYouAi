@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>成长角色与世界书</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" aria-label="档案导航">
+      <div class="brand"><span class="brand-icon" aria-hidden="true">✦</span><div><strong>角色与世界</strong><small>让故事留下记忆</small></div></div>
+      <label class="small-label" for="archive-picker">当前会话档案</label>
+      <select id="archive-picker" disabled><option>正在加载…</option></select>
+      <p id="archive-origin" class="origin"></p>
+      <div class="sidebar-heading"><span>世界书</span><span class="section-count">01</span></div>
+      <button class="nav-item" id="world-nav" data-select="world" disabled><span aria-hidden="true">◈</span><span>世界背景与势力</span></button>
+      <div class="sidebar-heading"><span>人设卡</span><span id="role-count" class="section-count">0</span></div>
+      <input id="role-search" type="search" placeholder="搜索角色" aria-label="搜索角色" disabled>
+      <nav id="role-list" aria-label="角色列表"></nav>
+      <div class="sidebar-footer"><span class="dot"></span>不同会话的剧情独立保存</div>
+    </aside>
+    <main>
+      <header class="toolbar"><div class="breadcrumb">成长角色与世界书 <span>/</span> <span id="breadcrumb">档案管理</span></div><button class="button quiet" id="refresh">刷新档案</button></header>
+      <div id="message" class="message" role="status" hidden></div>
+      <section id="empty" class="empty"><div class="empty-symbol" aria-hidden="true">✧</div><h1>故事的记忆，收在这里</h1><p id="empty-text">正在读取会话档案…</p></section>
+      <section id="workspace" hidden>
+        <div class="page-heading"><div><div class="eyebrow" id="eyebrow">世界书</div><h1 id="page-title">世界背景与势力</h1><p id="page-description"></p></div><div class="actions"><span id="save-state" class="save-state">已保存</span><button id="cancel" class="button quiet" hidden>取消</button><button id="edit" class="button primary">编辑内容</button><button id="save" class="button primary" hidden disabled>保存修改</button></div></div>
+        <div id="edit-note" class="edit-note" hidden>手动修改会直接保存到本会话档案，下次请求时读取。角色核心和固定规则也可由你修改，剧情模型不会自动改写它们。</div>
+        <div id="editor"></div>
+        <footer class="content-footer">自动成长只发生在上下文压缩时；此处的手动保存不调用模型。</footer>
+      </section>
+    </main>
+  </div>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

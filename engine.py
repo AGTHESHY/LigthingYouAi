@@ -415,6 +415,27 @@ class ArchiveStore:
         """
         return self.directory / (hashlib.sha256(scope.encode()).hexdigest() + ".json")
 
+    def id_path(self, archive_id):
+        """Resolve a validated opaque archive identifier inside this store.
+
+        Args:
+            archive_id: SHA-256 filename stem, never a filesystem path.
+
+        Returns:
+            Confined archive path.
+
+        Raises:
+            ValueError: Identifier is invalid.
+        """
+        if not isinstance(archive_id, str) or not re.fullmatch(
+            r"[a-f0-9]{64}", archive_id
+        ):
+            raise ValueError("Invalid archive identifier")
+        path = self.directory / (archive_id + ".json")
+        if path.is_symlink():
+            raise ValueError("Archive symlinks are not allowed")
+        return path
+
     def load(self, scope):
         """Load an archive and migrate old text fields without a network call.
 
@@ -427,7 +448,21 @@ class ArchiveStore:
         Raises:
             ValueError: Corrupt or unsupported archive.
         """
-        path = self.path(scope)
+        return self.load_id(self.path(scope).stem)
+
+    def load_id(self, archive_id):
+        """Read an archive using its validated opaque identifier.
+
+        Args:
+            archive_id: SHA-256 filename stem.
+
+        Returns:
+            Archive or None when absent.
+
+        Raises:
+            ValueError: Identifier or archive is invalid.
+        """
+        path = self.id_path(archive_id)
         if not path.exists():
             return None
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -461,7 +496,16 @@ class ArchiveStore:
             scope: Archive identity.
             archive: Validated content.
         """
-        path = self.path(scope)
+        self.save_id(self.path(scope).stem, archive)
+
+    def save_id(self, archive_id, archive):
+        """Atomically write a validated archive identifier.
+
+        Args:
+            archive_id: SHA-256 filename stem.
+            archive: Validated archive content.
+        """
+        path = self.id_path(archive_id)
         temporary = path.with_suffix(".tmp")
         try:
             temporary.write_text(
